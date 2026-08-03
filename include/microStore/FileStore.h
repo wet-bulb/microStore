@@ -604,6 +604,56 @@ USTORE_LOG("[ustore] exists: found key %s\n", bin_str(key, key_len));
 		return exists(key.data(), (uint8_t)key.size());
 	}
 
+	/* -------- TOUCH -------- */
+
+	// Refresh a record's timestamp in the in-memory index without rewriting the
+	// record. Returns false if the key is absent or already expired.
+	//
+	// The index timestamp is what both prune_index_to_max_recs() and
+	// is_ttl_expired() read, so touching it is what lets a caller express "this
+	// record is still in use": it moves the record to the young end of the
+	// eviction order and restarts its TTL. A caller that instead re-put() the
+	// record would get the same effect at the cost of a segment write, which on
+	// a flash-backed store is a write per use - the reason this exists.
+	//
+	// Deliberately does not persist. The on-disk index keeps its original
+	// timestamp, so recency ordering is lost across a reboot; that is the
+	// trade for costing nothing in flash.
+	bool touch(const uint8_t* key, uint8_t key_len, uint32_t ts = microStore::time())
+	{
+		if (!isValid()) {
+			USTORE_LOG("[ustore] touch: store is invalid\n");
+			return false;
+		}
+		if (key_len > USTORE_MAX_KEY_LEN) {
+			USTORE_LOG("[ustore] touch: failed due to excessive key length: %u\n", key_len);
+			return false;
+		}
+
+		IndexValue* e = index_find(key, key_len);
+		if (!e) {
+			return false;
+		}
+		if (is_ttl_expired(e->timestamp, e->ttl)) {
+			index_remove(key, key_len);
+			USTORE_LOG("[ustore] touch: key %s expired by TTL\n", bin_str(key, key_len));
+			return false;
+		}
+
+		e->timestamp = ts;
+		return true;
+	}
+
+	inline bool touch(const char* key, uint32_t ts = microStore::time())
+	{
+		return touch((const uint8_t*)key, (uint8_t)strlen(key), ts);
+	}
+
+	inline bool touch(const std::vector<uint8_t>& key, uint32_t ts = microStore::time())
+	{
+		return touch(key.data(), (uint8_t)key.size(), ts);
+	}
+
 	/* -------- SIZE -------- */
 
 	inline size_t size() const

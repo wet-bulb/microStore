@@ -80,6 +80,18 @@ public:
         return store.exists(k);
     }
 
+    // Mark a record as still in use: refreshes its index timestamp without
+    // rewriting it. See BasicFileStore::touch.
+    bool touch(const Key& key)
+    {
+        if (!isValid()) {
+			USTORE_LOG("[ustore] touch: store is invalid\n");
+			return false;
+		}
+        auto k = KeyCodec::encode(key);
+        return store.touch(k);
+    }
+
     size_t size() const
     {
         if (!isValid()) {
