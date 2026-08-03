@@ -616,9 +616,11 @@ USTORE_LOG("[ustore] exists: found key %s\n", bin_str(key, key_len));
 	// record would get the same effect at the cost of a segment write, which on
 	// a flash-backed store is a write per use - the reason this exists.
 	//
-	// Deliberately does not persist. The on-disk index keeps its original
-	// timestamp, so recency ordering is lost across a reboot; that is the
-	// trade for costing nothing in flash.
+	// Deliberately does not write. The refreshed value reaches disk only when a
+	// later compaction rewrites the record, which carries the index timestamp
+	// rather than the one on disk. So recency ordering survives a reboot if a
+	// compaction intervened and is lost otherwise - the trade for costing
+	// nothing in flash at the point of use.
 	bool touch(const uint8_t* key, uint8_t key_len, uint32_t ts = microStore::time())
 	{
 		if (!isValid()) {
@@ -1559,6 +1561,17 @@ USTORE_LOG("[ustore] Opening src file: %s\n", src_name);
 						if (hdr.length > 0 && src.read(val_buf, hdr.length) != hdr.length) {
 							USTORE_LOG("[ustore] WARNING: Failed to read record value\n");
 							continue;
+						}
+						// Carry the index's timestamp rather than the one on
+						// disk. touch() refreshes the index only, so without
+						// this a compaction would silently revert every touched
+						// record to its original stamp and undo the eviction
+						// ordering the caller asked for. Compaction is already
+						// rewriting the record, so persisting the refreshed
+						// value costs nothing extra.
+						{
+							IndexValue* iv = index_find(key_buf, hdr.key_len);
+							if (iv) hdr.timestamp = iv->timestamp;
 						}
 						RecordCommit c; c.magic = MAGIC_COMMIT;
 						uint32_t expected = sizeof(hdr) + hdr.key_len + hdr.length + sizeof(c);
