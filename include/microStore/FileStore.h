@@ -123,6 +123,10 @@ public:
 
 	using allocator_type = Allocator;
 
+	// Returns true if the record under this key should be spared by eviction.
+	// See set_protect_fn.
+	using ProtectFn = bool (*)(const uint8_t* key, uint8_t key_len, void* ctx);
+
 	BasicFileStore(uint32_t segment_size = USTORE_DEFAULT_SEGMENT_SIZE, uint8_t segment_count = USTORE_DEFAULT_SEGMENT_COUNT) : BasicFileStore(Allocator{}, segment_size, segment_count) {}
 	explicit BasicFileStore(const Allocator& alloc, uint32_t segment_size = USTORE_DEFAULT_SEGMENT_SIZE, uint8_t segment_count = USTORE_DEFAULT_SEGMENT_COUNT)
 		: _alloc(alloc), _segment_size(segment_size), _segment_count(segment_count), _index(map_alloc_type(_alloc)) { write_buf_pos = 0; }
@@ -629,6 +633,24 @@ USTORE_LOG("[ustore] set_max_recs: %u\n", max_recs);
 		policy_max_recs = max_recs;
 	}
 
+	// Optionally protect records from eviction. The callback is asked, for each
+	// candidate, whether that key should be spared; the record cap still holds
+	// exactly, so protection is a preference and not a guarantee: victims are
+	// drawn from the unprotected records oldest-first, and only once none are
+	// left does eviction fall through to the oldest protected one.
+	//
+	// The default is no callback, which reproduces plain oldest-first eviction
+	// byte for byte. A raw function pointer plus context is used rather than
+	// std::function so that installing a policy allocates nothing.
+	//
+	// Called once per indexed record per prune, so it should be cheap - a set
+	// lookup, not a search.
+	inline void set_protect_fn(ProtectFn fn, void* ctx = nullptr)
+	{
+		policy_protect_fn = fn;
+		policy_protect_ctx = ctx;
+	}
+
 	/* -------- DUMP INFO -------- */
 
 	void dumpInfo(bool detailed = true)
@@ -968,6 +990,14 @@ private:
 		return evicted;
 	}
 
+	// False whenever no policy is installed, which is what keeps the default
+	// eviction path identical to plain oldest-first.
+	inline bool is_protected(const KeyType& key) const
+	{
+		return policy_protect_fn != nullptr &&
+		       policy_protect_fn(key.data(), (uint8_t)key.size(), policy_protect_ctx);
+	}
+
 	bool is_ttl_expired(uint32_t ts, uint32_t record_ttl) const
 	{
 		uint32_t effective_ttl = (record_ttl > 0) ? record_ttl : policy_ttl_secs;
@@ -990,22 +1020,36 @@ private:
 		size_t to_evict = _index.size() - target;
 
 		if (to_evict == 1) {
-			// Fast path: single linear scan for the oldest entry.
-			auto oldest = _index.begin();
+			// Fast path: single linear scan for the oldest entry. Tracks the
+			// oldest unprotected and the oldest overall in one pass, so a
+			// protected record is only taken when nothing else is left.
+			auto oldest_any = _index.begin();
+			auto oldest_free = _index.end();
 			for (auto it = _index.begin(); it != _index.end(); ++it) {
-				if (it->second.timestamp < oldest->second.timestamp) oldest = it;
+				if (it->second.timestamp < oldest_any->second.timestamp) oldest_any = it;
+				if (!is_protected(it->first)) {
+					if (oldest_free == _index.end() ||
+					    it->second.timestamp < oldest_free->second.timestamp) {
+						oldest_free = it;
+					}
+				}
 			}
-			_index.erase(oldest);
+			_index.erase(oldest_free != _index.end() ? oldest_free : oldest_any);
 		}
 		else {
-			// Bulk path: collect (timestamp, key) pairs, partial-sort, then erase.
-			using KTSPair = std::pair<uint32_t, KeyType>;
+			// Bulk path: collect ((protected, timestamp), key) pairs,
+			// partial-sort, then erase. Ordering on the pair sorts unprotected
+			// before protected and oldest first within each group, so victims
+			// are drawn from the unprotected set until it is exhausted.
+			using KTSKey = std::pair<bool, uint32_t>;
+			using KTSPair = std::pair<KTSKey, KeyType>;
 			using KTSAlloc = rebind_alloc<KTSPair>;
 			KTSAlloc kts_alloc(_alloc);
 			std::vector<KTSPair, KTSAlloc> candidates(kts_alloc);
 			candidates.reserve(_index.size());
 			for (auto& kv : _index)
-				candidates.push_back(std::make_pair(kv.second.timestamp, kv.first));
+				candidates.push_back(std::make_pair(
+					KTSKey(is_protected(kv.first), kv.second.timestamp), kv.first));
 			std::partial_sort(candidates.begin(), candidates.begin() + (long)to_evict, candidates.end(),
 				[](const KTSPair& a, const KTSPair& b){ return a.first < b.first; });
 			for (size_t i = 0; i < to_evict; i++) {
@@ -1589,6 +1633,8 @@ private:
 
 	uint32_t policy_ttl_secs = USTORE_DEFAULT_TTL_SECS; // 0 = TTL disabled (seconds)
 	uint32_t policy_max_recs = USTORE_DEFAULT_MAX_RECS; // 0 = max-records disabled
+	ProtectFn policy_protect_fn = nullptr;              // nullptr = nothing protected
+	void* policy_protect_ctx = nullptr;
 
 	uint8_t write_buf[USTORE_WRITE_BUFFER_SIZE];
 	size_t write_buf_pos;
